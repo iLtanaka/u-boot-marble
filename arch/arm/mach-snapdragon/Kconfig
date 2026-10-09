@@ -24,7 +24,7 @@ config SYS_MALLOC_LEN
 	default 0x800000
 
 config LNX_KRNL_IMG_TEXT_OFFSET_BASE
-	default 0x80000000
+	default 0x0
 
 config SPL_SHARES_INIT_SP_ADDR
 	# override the default from common/spl/Kconfig
@@ -58,6 +58,16 @@ config QCOM_GENERATE_MBN
 
 	  New platforms can be added to tools/qcom/mkmbn/mkmbn.py if they aren't already
 	  supported.
+
+config QCOM_PREFER_PREVBL_MEMORY
+	bool "Prefer the memory map from the previous bootloader's DT"
+	help
+	  When U-Boot is chainloaded by ABL with a built-in DT, take the
+	  /memory node from the DT that ABL passes in x0 instead of the one in
+	  the built-in DT. ABL fills it with the banks of the RAM that is
+	  actually fitted, so one U-Boot build works on every RAM variant of a
+	  phone (e.g. 8, 12 and 16 GiB). The built-in /memory node is used as a
+	  fallback when ABL does not provide one.
 
 choice
 	prompt "Qualcomm boot0.h workaround"

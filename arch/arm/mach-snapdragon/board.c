@@ -97,8 +97,18 @@ int board_fdt_blob_setup(void **fdtp)
 		panic("Internal FDT is invalid and no external FDT was provided! (fdt=%#llx)\n",
 		      (phys_addr_t)external_fdt);
 
+	/*
+	 * ABL fills /memory in the DT it passes with the RAM actually fitted;
+	 * boards with several RAM variants can opt in to use it first.
+	 */
+	if (IS_ENABLED(CONFIG_QCOM_PREFER_PREVBL_MEMORY) && external_valid) {
+		ret = qcom_parse_memory(external_fdt, false);
+		if (ret < 0)
+			debug("No memory info in external FDT, falling back to internal\n");
+	}
+
 	/* Prefer memory information from internal DT if it's present */
-	if (internal_valid)
+	if (ret < 0 && internal_valid)
 		ret = qcom_parse_memory(internal_fdt, true);
 
 	if (ret < 0 && external_valid) {

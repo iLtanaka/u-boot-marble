@@ -154,6 +154,7 @@ static void qcom_parse_memory_dt(const fdt64_t *fdt, int *banks, phys_addr_t *ra
 	int i, j;
 
 	*ram_end = 0;
+	*banks = 0;
 
 	offset = fdt_path_offset(fdt, "/memory");
 	if (offset < 0)
@@ -216,7 +217,13 @@ int qcom_parse_memory(const void *fdt, bool fdt_is_internal)
 	qcom_memmap_source = fdt_is_internal ? QCOM_MEMMAP_SOURCE_INTERNAL_FDT
 					     : QCOM_MEMMAP_SOURCE_EXTERNAL_FDT;
 
+	memset(prevbl_ddr_banks, 0, sizeof(prevbl_ddr_banks));
 	qcom_parse_memory_dt(fdt, &banks, &ram_end);
+
+	/* An external FDT without a usable /memory node is not an error here,
+	 * the caller can fall back to the internal FDT. */
+	if (!prevbl_ddr_banks[0].size && !fdt_is_internal)
+		return -ENODATA;
 
 	/*
 	 * If using an internal FDT but the memory node is empty
@@ -225,7 +232,7 @@ int qcom_parse_memory(const void *fdt, bool fdt_is_internal)
 	if (!prevbl_ddr_banks[0].size && fdt_is_internal) {
 		banks = qcom_parse_memory_smem(&ram_end);
 		if (banks < 0)
-			panic("Couldn't find a valid memory map!\n");
+			return -ENODATA;
 		qcom_memmap_source = QCOM_MEMMAP_SOURCE_SMEM;
 	}
 

@@ -120,6 +120,11 @@ static void configure_reserved_memory(void)
 		if (fdt_getprop(gd->fdt_blob, rmem, "compatible", NULL))
 			attrs = PTE_TYPE_VALID | PTE_BLOCK_MEMTYPE(MT_NORMAL);
 
+		/* Never fault display framebuffer or splash memory */
+		const char *node_name = fdt_get_name(gd->fdt_blob, rmem, NULL);
+		if (node_name && (strstr(node_name, "framebuffer") || strstr(node_name, "splash")))
+			attrs = PTE_TYPE_VALID | PTE_BLOCK_MEMTYPE(MT_NORMAL);
+
 		if (i == N_RESERVED_REGIONS) {
 			log_err("Too many reserved regions!\n");
 			break;
@@ -216,7 +221,9 @@ void enable_caches(void)
 	 * reserved regions as inacessible (PTE_TYPE_FAULT)
 	 */
 	if (qcom_memmap_source == QCOM_MEMMAP_SOURCE_SMEM ||
-	    fdt_node_check_compatible(gd->fdt_blob, 0, "qcom,qcs404") == 0) {
+	    fdt_node_check_compatible(gd->fdt_blob, 0, "qcom,qcs404") == 0 ||
+	    fdt_node_check_compatible(gd->fdt_blob, 0, "qcom,sm8450") == 0 ||
+	    fdt_node_check_compatible(gd->fdt_blob, 0, "qcom,sm8475") == 0) {
 		carveout_start = get_timer(0);
 		/* Takes ~20-50ms on SDM845 */
 		configure_reserved_memory();
