@@ -229,6 +229,15 @@ config USB_FUNCTION_ACM
 	  interoperate with MS-Windows hosts or with the Linux-USB "cdc-acm"
 	  driver.
 
+config USB_FUNCTION_ACM_NOWAIT
+	bool "Don't wait for the host when starting the ACM console"
+	depends on USB_FUNCTION_ACM
+	help
+	  Return from the usbacm stdio start immediately instead of blocking
+	  until a host opens the port. Console output is buffered until the
+	  host connects. This allows enabling the USB serial console
+	  unconditionally at boot without hanging when no cable is attached.
+
 endif # USB_GADGET_DOWNLOAD
 
 config USB_ETHER

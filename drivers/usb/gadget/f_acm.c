@@ -651,6 +651,15 @@ static int acm_stdio_start(struct stdio_dev *dev)
 	else
 		return -ENODEV;
 
+	/*
+	 * Don't wait for the host: output is buffered in tx_buf until the
+	 * host opens the port, and tstc() keeps servicing the controller so
+	 * enumeration completes whenever a cable is plugged in. Waiting here
+	 * would hang the boot when nothing is connected.
+	 */
+	if (IS_ENABLED(CONFIG_USB_FUNCTION_ACM_NOWAIT))
+		return 0;
+
 	while (!acm_connected(dev)) {
 		if (ctrlc())
 			return -ECANCELED;
