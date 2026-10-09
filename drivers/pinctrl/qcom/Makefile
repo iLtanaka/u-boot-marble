@@ -24,6 +24,7 @@ obj-$(CONFIG_PINCTRL_QCOM_SM6350) += pinctrl-sm6350.o
 obj-$(CONFIG_PINCTRL_QCOM_SM7150) += pinctrl-sm7150.o
 obj-$(CONFIG_PINCTRL_QCOM_SM8150) += pinctrl-sm8150.o
 obj-$(CONFIG_PINCTRL_QCOM_SM8250) += pinctrl-sm8250.o
+obj-$(CONFIG_PINCTRL_QCOM_SM8450) += pinctrl-sm8450.o
 obj-$(CONFIG_PINCTRL_QCOM_SM8550) += pinctrl-sm8550.o
 obj-$(CONFIG_PINCTRL_QCOM_SM8650) += pinctrl-sm8650.o
 obj-$(CONFIG_PINCTRL_QCOM_X1E80100) += pinctrl-x1e80100.o
