@@ -150,6 +150,14 @@ config CLK_QCOM_SM8250
 	  on the Snapdragon SM8250 SoC. This driver supports the clocks
 	  and resets exposed by the GCC hardware block.
 
+config CLK_QCOM_SM8450
+	bool "Qualcomm SM8450 / SM8475 GCC"
+	select CLK_QCOM
+	help
+	  Say Y here to enable support for the Global Clock Controller
+	  on the Snapdragon SM8450 and SM8475 SoCs. This driver supports
+	  the clocks, resets and GDSCs exposed by the GCC hardware block.
+
 config CLK_QCOM_SM8550
 	bool "Qualcomm SM8550 GCC"
 	select CLK_QCOM
