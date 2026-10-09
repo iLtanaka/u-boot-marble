@@ -13,6 +13,8 @@
 #include <generic-phy.h>
 #include <malloc.h>
 #include <reset.h>
+#include <asm/gpio.h>
+#include <power/regulator.h>
 
 #include <asm/io.h>
 #include <linux/bitops.h>
@@ -126,6 +128,7 @@ struct qcom_snps_eusb2_phy_priv {
 	void __iomem *base;
 	struct clk *ref_clk;
 	struct reset_ctl_bulk resets;
+	struct gpio_desc repeater_reset;
 };
 
 static void qcom_snps_eusb2_hsphy_write_mask(void __iomem *base, u32 offset,
@@ -290,12 +293,60 @@ static int qcom_snps_eusb2_usb_init(struct phy *phy)
 	return 0;
 }
 
+/*
+ * Minimal eUSB2 repeater bring-up. The NXP PTN3222 needs no register
+ * programming, only its supplies on and reset released (as the Linux
+ * phy-nxp-ptn3222 driver does), so handle it here straight from the DT
+ * node instead of probing its I2C bus. ABL only sets the repeater up when
+ * it enters fastboot itself, so without this the gadget does not enumerate
+ * after a normal boot.
+ */
+static void qcom_snps_eusb2_repeater_init(struct udevice *dev)
+{
+	struct qcom_snps_eusb2_phy_priv *qcom_snps_eusb2 = dev_get_priv(dev);
+	static const char * const supplies[] = { "vdd1v8-supply", "vdd3v3-supply" };
+	struct ofnode_phandle_args args;
+	struct udevice *reg;
+	ofnode supply;
+	int i, ret;
+
+	if (dev_read_phandle_with_args(dev, "phys", "#phy-cells", 0, 0, &args))
+		return;
+	if (!ofnode_device_is_compatible(args.node, "nxp,ptn3222"))
+		return;
+
+	for (i = 0; i < ARRAY_SIZE(supplies); i++) {
+		supply = ofnode_parse_phandle(args.node, supplies[i], 0);
+		if (!ofnode_valid(supply))
+			continue;
+		ret = uclass_get_device_by_ofnode(UCLASS_REGULATOR, supply, &reg);
+		if (!ret)
+			ret = regulator_set_enable_if_allowed(reg, true);
+		if (ret)
+			dev_warn(dev, "repeater %s: %d\n", supplies[i], ret);
+	}
+
+	if (!dm_gpio_is_valid(&qcom_snps_eusb2->repeater_reset)) {
+		ret = gpio_request_by_name_nodev(args.node, "reset-gpios", 0,
+						 &qcom_snps_eusb2->repeater_reset,
+						 GPIOD_IS_OUT | GPIOD_IS_OUT_ACTIVE);
+		if (ret) {
+			dev_warn(dev, "repeater reset gpio: %d\n", ret);
+			return;
+		}
+		udelay(1000);
+	}
+
+	dm_gpio_set_value(&qcom_snps_eusb2->repeater_reset, 0);
+	udelay(1000);
+}
+
 static int qcom_snps_eusb2_phy_power_on(struct phy *phy)
 {
 	struct qcom_snps_eusb2_phy_priv *qcom_snps_eusb2 = dev_get_priv(phy->dev);
 	int ret;
 
-	/* TODO Repeater */
+	qcom_snps_eusb2_repeater_init(phy->dev);
 
 	clk_prepare_enable(qcom_snps_eusb2->ref_clk);
 
