@@ -1,0 +1,153 @@
+// SPDX-License-Identifier: BSD-3-Clause
+/*
+ * Copyright (c) 2024, Danila Tikhonov <danila@jiaxyga.com>
+ */
+
+#include "sm8450.dtsi"
+
+/delete-node/ &usb_1_hsphy;
+/delete-node/ &ufs_mem_phy;
+
+/*
+ * sm8450.dtsi has no CPU capacity information, so the scheduler treats the
+ * Cortex-A510 cores as equal to the Cortex-X2 and EAS stays disabled.
+ * Values taken from the downstream (stock) device tree.
+ */
+&cpu0 { capacity-dmips-mhz = <1024>; dynamic-power-coefficient = <100>; };
+&cpu1 { capacity-dmips-mhz = <1024>; dynamic-power-coefficient = <100>; };
+&cpu2 { capacity-dmips-mhz = <1024>; dynamic-power-coefficient = <100>; };
+&cpu3 { capacity-dmips-mhz = <1024>; dynamic-power-coefficient = <100>; };
+&cpu4 { capacity-dmips-mhz = <2253>; dynamic-power-coefficient = <257>; };
+&cpu5 { capacity-dmips-mhz = <2253>; dynamic-power-coefficient = <257>; };
+&cpu6 { capacity-dmips-mhz = <2253>; dynamic-power-coefficient = <257>; };
+&cpu7 { capacity-dmips-mhz = <2386>; dynamic-power-coefficient = <509>; };
+
+&soc {
+	usb_1_hsphy: phy@88e3000 {
+		compatible = "qcom,sm8475-snps-eusb2-phy",
+			     "qcom,sm8550-snps-eusb2-phy";
+		reg = <0 0x088e3000 0 0x154>;
+		#phy-cells = <0>;
+
+		clocks = <&rpmhcc RPMH_CXO_CLK>;
+		clock-names = "ref";
+
+		resets = <&gcc GCC_QUSB2PHY_PRIM_BCR>;
+
+		status = "disabled";
+	};
+
+	ufs_mem_phy: phy@1d80000 {
+		compatible = "qcom,sm8475-qmp-ufs-phy";
+		reg = <0 0x1d80000 0 0x2000>;
+
+		clocks = <&rpmhcc RPMH_CXO_CLK>,
+			 <&gcc GCC_UFS_PHY_PHY_AUX_CLK>,
+			 <&gcc GCC_UFS_0_CLKREF_EN>;
+		clock-names = "ref",
+			      "ref_aux",
+			      "qref";
+
+		resets = <&ufs_mem_hc 0>;
+		reset-names = "ufsphy";
+
+		#clock-cells = <1>;
+		#phy-cells = <0>;
+
+		status = "disabled";
+	};
+};
+
+&camcc {
+	compatible = "qcom,sm8475-camcc";
+};
+
+&dispcc {
+	compatible = "qcom,sm8475-dispcc";
+};
+
+&gcc {
+	compatible = "qcom,sm8475-gcc";
+};
+
+&gpu {
+	gpu_opp_table: opp-table {
+		compatible = "operating-points-v2";
+		opp-900000000 {
+			opp-hz = /bits/ 64 <900000000>;
+			opp-level = <RPMH_REGULATOR_LEVEL_TURBO_L1>;
+		};
+		opp-862000000 {
+			opp-hz = /bits/ 64 <862000000>;
+			opp-level = <RPMH_REGULATOR_LEVEL_TURBO>;
+		};
+		opp-815000000 {
+			opp-hz = /bits/ 64 <815000000>;
+			opp-level = <RPMH_REGULATOR_LEVEL_NOM_L1>;
+		};
+		opp-765000000 {
+			opp-hz = /bits/ 64 <765000000>;
+			opp-level = <RPMH_REGULATOR_LEVEL_NOM>;
+		};
+		opp-710000000 {
+			opp-hz = /bits/ 64 <710000000>;
+			opp-level = <RPMH_REGULATOR_LEVEL_SVS_L2>;
+		};
+		opp-645000000 {
+			opp-hz = /bits/ 64 <645000000>;
+			opp-level = <RPMH_REGULATOR_LEVEL_SVS_L1>;
+		};
+		opp-580000000 {
+			opp-hz = /bits/ 64 <580000000>;
+			opp-level = <RPMH_REGULATOR_LEVEL_SVS_L0>;
+		};
+		opp-515000000 {
+			opp-hz = /bits/ 64 <515000000>;
+			opp-level = <RPMH_REGULATOR_LEVEL_SVS>;
+		};
+		opp-439000000 {
+			opp-hz = /bits/ 64 <439000000>;
+			opp-level = <RPMH_REGULATOR_LEVEL_LOW_SVS_L2>;
+		};
+		opp-364000000 {
+			opp-hz = /bits/ 64 <364000000>;
+			opp-level = <RPMH_REGULATOR_LEVEL_LOW_SVS_L1>;
+		};
+		opp-324000000 {
+			opp-hz = /bits/ 64 <324000000>;
+			opp-level = <RPMH_REGULATOR_LEVEL_LOW_SVS>;
+		};
+		opp-285000000 {
+			opp-hz = /bits/ 64 <285000000>;
+			opp-level = <RPMH_REGULATOR_LEVEL_LOW_SVS_D1>;
+		};
+		opp-220000000 {
+			opp-hz = /bits/ 64 <220000000>;
+			opp-level = <RPMH_REGULATOR_LEVEL_MIN_SVS>;
+		};
+	};
+};
+
+&gpucc {
+	compatible = "qcom,sm8475-gpucc";
+};
+
+&tlmm {
+	compatible = "qcom,sm8475-tlmm";
+};
+
+&ufs_mem_hc {
+	freq-table-hz =
+		<75000000 850000000>,
+		<0 0>,
+		<0 0>,
+		<75000000 850000000>,
+		<75000000 850000000>,
+		<0 0>,
+		<0 0>,
+		<0 0>;
+};
+
+&videocc {
+	compatible = "qcom,sm8475-videocc";
+};
