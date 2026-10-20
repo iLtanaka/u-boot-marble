@@ -2,7 +2,7 @@
 
 Mainline U-Boot port for the **Xiaomi Poco F5 / Redmi Note 12 Turbo** (`xiaomi-marble`, Qualcomm Snapdragon 7+ Gen 2 / SM7475).
 
-The bootloader is chainloaded by the stock Android Bootloader (ABL) on slot B (`boot_b`), providing extlinux boot capability from UFS storage, a countdown boot menu, and an interactive USB serial console (`/dev/ttyACM0`).
+The bootloader is chainloaded by the stock Android Bootloader (ABL) on slot B (`boot_b`), providing extlinux boot capability from UFS storage, a countdown boot menu, USB mass storage and fastboot modes, and an interactive USB serial console (`/dev/ttyACM0`) started from the menu.
 
 ---
 
@@ -11,7 +11,7 @@ The bootloader is chainloaded by the stock Android Bootloader (ABL) on slot B (`
 * **Display**: SimpleFB display console on internal AMOLED panel (1080x2400).
 * **Storage**: Qualcomm QMP UFS 3.1 controller (`scsi 0`).
 * **Input**: Volume Up / Volume Down keys via PM8350 SPMI GPIO for boot menu navigation.
-* **USB**: DWC3 peripheral controller with PTN3222 eUSB2 repeater and USB CDC ACM serial console.
+* **USB**: DWC3 peripheral controller with PTN3222 eUSB2 repeater and USB CDC ACM serial console, USB mass storage (UMS) and fastboot gadgets. Only one gadget can be active per boot: reset the phone before switching between the serial console and mass storage or fastboot.
 * **Memory**: Universal RAM bank parsing from previous bootloader (ABL) via `CONFIG_QCOM_PREFER_PREVBL_MEMORY` (supports 8 GB, 12 GB, and 16 GB models).
 
 ---
@@ -179,7 +179,7 @@ The installer is a convenience. U-Boot only requires a GPT partition labeled `es
 ## Boot Workflow
 
 1. ABL executes `boot_b` and starts U-Boot.
-2. U-Boot initializes display, UFS, and USB serial console.
+2. U-Boot initializes display and UFS. The USB serial console starts only when its menu entry is chosen.
 3. An interactive 5-second countdown menu appears. Holding **Volume Down** interrupts the countdown.
 4. By default, U-Boot scans for the partition labeled `esp` on LUN0 and executes `/extlinux/extlinux.conf`.
 
