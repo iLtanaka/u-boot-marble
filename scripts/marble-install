@@ -1,0 +1,634 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+"""Install postmarketOS on the internal UFS of a Xiaomi Poco F5 (marble).
+
+The phone runs the U-Boot from this repository and exports UFS LUN 0 to the
+PC with the "Enable USB mass storage" boot menu entry. This script then
+
+  1. checks that the exported disk really is the phone's LUN 0,
+  2. saves the partition table,
+  3. creates the "esp" and "pmos" partitions (keeping Android or not),
+  4. writes the boot and root images made by "pmbootstrap install --split",
+  5. grows the filesystems to fill the partitions.
+
+Only LUN 0 is exported by U-Boot. The boot chain (LUN 1 to 5) is not
+reachable from the PC. Partitions other than userdata, esp and pmos are never
+modified, and the GPT entries of all partitions keep their original bytes
+(including the A/B slot attribute bits).
+"""
+
+import argparse
+import fcntl
+import json
+import mmap
+import os
+import re
+import shutil
+import stat
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+import zlib
+
+HDR = struct.Struct("<8sIIIIQQQQ16sQIII")
+HDR_KEYS = ("sig rev hsize hcrc rsv cur bak first last guid ents n esz ecrc").split()
+EFI_SYSTEM = uuid.UUID("C12A7328-F81F-11D2-BA4B-00A0C93EC93B").bytes_le
+LINUX_FS = uuid.UUID("0FC63DAF-8483-4772-8E79-3D69D8477DE4").bytes_le
+# Partitions on LUN 0 of every marble, before and after installation (userdata is
+# gone after a single boot installation).
+FINGERPRINT = {"super", "metadata", "devinfo", "vbmeta_system_a"}
+MIB = 1 << 20
+GIB = 1 << 30
+MIN_ANDROID = 32 * GIB
+TESTING = os.environ.get("MARBLE_INSTALL_TESTING") == "1"
+
+
+class Error(Exception):
+    pass
+
+
+def ioctl_u64(fd, req):
+    return struct.unpack("Q", fcntl.ioctl(fd, req, bytes(8)))[0]
+
+
+class Disk:
+    """Block device (or, for tests, an image file) with 4096-byte LBAs."""
+
+    def __init__(self, path, writable=False, sector_size=None):
+        self.path = path
+        self.fd = os.open(path, os.O_RDWR if writable else os.O_RDONLY)
+        mode = os.fstat(self.fd).st_mode
+        if stat.S_ISBLK(mode):
+            self.ss = struct.unpack("i", fcntl.ioctl(self.fd, 0x1268, bytes(4)))[0]
+            self.size = ioctl_u64(self.fd, 0x80081272)
+            self.is_block = True
+        elif stat.S_ISREG(mode) and TESTING:
+            self.ss = sector_size or 4096
+            self.size = os.fstat(self.fd).st_size
+            self.is_block = False
+        else:
+            raise Error(f"{path} is not a block device")
+        self.nlba = self.size // self.ss
+
+    def read(self, lba, count=1):
+        return os.pread(self.fd, count * self.ss, lba * self.ss)
+
+    def write(self, lba, data):
+        if len(data) % self.ss:
+            raise Error("unaligned write")
+        if os.pwrite(self.fd, data, lba * self.ss) != len(data):
+            raise Error("short write")
+
+    def sync(self):
+        os.fsync(self.fd)
+        try:
+            os.posix_fadvise(self.fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        except OSError:
+            pass
+
+    def close(self):
+        os.close(self.fd)
+
+
+class Gpt:
+    def __init__(self, disk):
+        self.disk = disk
+        ss = disk.ss
+        self.mbr = disk.read(0)
+        raw = disk.read(1)
+        self.hdr = self.parse(raw)
+        h = self.hdr
+        if h["sig"] != b"EFI PART":
+            raise Error("no GPT on this disk")
+        if self.hcrc(raw, h["hsize"]) != h["hcrc"]:
+            raise Error("primary GPT header CRC mismatch")
+        self.esec = -(-h["n"] * h["esz"] // ss)
+        self.ents = disk.read(h["ents"], self.esec)[: h["n"] * h["esz"]]
+        if zlib.crc32(self.ents) != h["ecrc"]:
+            raise Error("primary GPT entries CRC mismatch")
+        if h["bak"] != disk.nlba - 1:
+            raise Error("backup GPT is not at the end of the disk")
+        braw = disk.read(h["bak"])
+        self.bhdr = self.parse(braw)
+        b = self.bhdr
+        if b["sig"] != b"EFI PART" or self.hcrc(braw, b["hsize"]) != b["hcrc"]:
+            raise Error("backup GPT header is invalid")
+        bents = disk.read(b["ents"], self.esec)[: b["n"] * b["esz"]]
+        if bents != self.ents:
+            raise Error("primary and backup GPT entries differ")
+
+    @staticmethod
+    def parse(raw):
+        return dict(zip(HDR_KEYS, HDR.unpack(raw[:92])))
+
+    @staticmethod
+    def hcrc(raw, hsize):
+        buf = bytearray(raw[:hsize])
+        buf[16:20] = bytes(4)
+        return zlib.crc32(bytes(buf))
+
+    def slot(self, i):
+        esz = self.hdr["esz"]
+        return self.ents[i * esz : (i + 1) * esz]
+
+    def partitions(self):
+        out = []
+        for i in range(self.hdr["n"]):
+            e = self.slot(i)
+            if e[:16] == bytes(16):
+                continue
+            start, end, attr = struct.unpack("<QQQ", e[32:56])
+            name = e[56:128].decode("utf-16le").split("\0")[0]
+            out.append(dict(slot=i, num=i + 1, type=e[:16], uniq=e[16:32], start=start,
+                            end=end, attr=attr, name=name))
+        return out
+
+    def find(self, name):
+        for p in self.partitions():
+            if p["name"] == name:
+                return p
+        return None
+
+    def free_slot(self, ents):
+        esz = self.hdr["esz"]
+        for i in range(self.hdr["n"]):
+            if ents[i * esz : i * esz + 16] == bytes(16):
+                return i
+        raise Error("the GPT has no free entry")
+
+    def header_sector(self, base, ents, cur, bak, ents_lba):
+        h = dict(base, cur=cur, bak=bak, ents=ents_lba, ecrc=zlib.crc32(bytes(ents)), hcrc=0)
+        raw = bytearray(HDR.pack(*[h[k] for k in HDR_KEYS]))
+        raw += bytes(h["hsize"] - len(raw))
+        raw[16:20] = struct.pack("<I", zlib.crc32(bytes(raw)))
+        return bytes(raw) + bytes(self.disk.ss - len(raw))
+
+    def pad(self, ents):
+        return bytes(ents) + bytes(self.esec * self.disk.ss - len(ents))
+
+    def apply(self, ents):
+        """Write new entries, backup copy first, and verify by reading back."""
+        d, h, b = self.disk, self.hdr, self.bhdr
+        d.write(b["ents"], self.pad(ents))
+        d.write(b["cur"], self.header_sector(b, ents, b["cur"], b["bak"], b["ents"]))
+        d.sync()
+        d.write(h["ents"], self.pad(ents))
+        d.write(1, self.header_sector(h, ents, 1, h["bak"], h["ents"]))
+        d.sync()
+        new = Gpt(d)
+        if new.ents != bytes(ents):
+            raise Error("GPT readback mismatch")
+        return new
+
+    def save(self, path):
+        d, h, b = self.disk, self.hdr, self.bhdr
+        prim = d.read(1, 1 + self.esec)
+        back = d.read(b["ents"], self.esec + 1)
+        meta = dict(sector_size=d.ss, nlba=d.nlba, guid=h["guid"].hex(),
+                    primary=len(prim), backup=len(back),
+                    primary_lba=1, backup_lba=b["ents"])
+        with open(path, "wb") as f:
+            f.write(json.dumps(meta).encode() + b"\n" + prim + back)
+            f.flush()
+            os.fsync(f.fileno())
+
+
+def restore_gpt(disk, path):
+    with open(path, "rb") as f:
+        meta = json.loads(f.readline())
+        prim, back = f.read(meta["primary"]), f.read(meta["backup"])
+    if (meta["sector_size"], meta["nlba"]) != (disk.ss, disk.nlba):
+        raise Error("the backup belongs to a disk of a different size")
+    cur = Gpt(disk)
+    if cur.hdr["guid"].hex() != meta["guid"]:
+        raise Error("the backup belongs to a different disk GUID")
+    disk.write(meta["backup_lba"], back)
+    disk.sync()
+    disk.write(meta["primary_lba"], prim)
+    disk.sync()
+    return Gpt(disk)
+
+
+def parse_size(text):
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)\s*([MG])(?:i?B)?", text.strip(), re.I)
+    if not m:
+        raise Error(f"bad size '{text}' (use e.g. 512M or 64G)")
+    return int(float(m.group(1)) * (GIB if m.group(2).upper() == "G" else MIB))
+
+
+def human(n):
+    return f"{n / GIB:.1f} GiB" if n >= GIB else f"{n / MIB:.0f} MiB"
+
+
+def make_entry(esz, ptype, uniq, start, end, name):
+    e = bytearray(esz)
+    e[:16], e[16:32] = ptype, uniq
+    e[32:56] = struct.pack("<QQQ", start, end, 0)
+    e[56:128] = name.encode("utf-16le").ljust(72, b"\0")
+    return e
+
+
+# --- device discovery -------------------------------------------------------
+
+def usb_disk(name):
+    return "/usb" in os.path.realpath(f"/sys/block/{name}")
+
+
+def sysfs(name, attr):
+    try:
+        with open(f"/sys/block/{name}/device/{attr}") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def is_mounted(path):
+    base = os.path.realpath(path)
+    with open("/proc/mounts") as f:
+        for line in f:
+            dev = line.split()[0]
+            if dev.startswith("/dev/") and os.path.realpath(dev).startswith(base):
+                return True
+    return False
+
+
+def candidates():
+    out = []
+    for name in sorted(os.listdir("/sys/block")):
+        if not name.startswith("sd") or not usb_disk(name):
+            continue
+        path = f"/dev/{name}"
+        try:
+            disk = Disk(path)
+            names = {p["name"] for p in Gpt(disk).partitions()}
+            disk.close()
+        except (Error, OSError):
+            continue
+        if FINGERPRINT <= names:
+            out.append(path)
+    return out
+
+
+def check_marble(disk, gpt):
+    if disk.ss != 4096:
+        raise Error(f"logical sector size is {disk.ss}, a marble LUN 0 has 4096")
+    if not FINGERPRINT <= {p["name"] for p in gpt.partitions()}:
+        raise Error("the partition table does not look like LUN 0 of a marble "
+                    "(missing " + ", ".join(sorted(FINGERPRINT - {p["name"] for p in gpt.partitions()})) + ")")
+    if not TESTING and not usb_disk(os.path.basename(os.path.realpath(disk.path))):
+        raise Error(f"{disk.path} is not a USB disk")
+    if is_mounted(disk.path):
+        raise Error(f"a partition of {disk.path} is mounted, unmount it first")
+
+
+# --- layout -----------------------------------------------------------------
+
+def plan_layout(gpt, layout, esp_size, pmos_size):
+    """Return (new_entries, plan lines, partition numbers)."""
+    ss = gpt.disk.ss
+    align = MIB // ss
+    esz = gpt.hdr["esz"]
+    ents = bytearray(gpt.ents)
+    parts = gpt.partitions()
+    lines = []
+    esp, pmos = gpt.find("esp"), gpt.find("pmos")
+
+    if layout == "reinstall":
+        if not (esp and pmos):
+            raise Error("no esp and pmos partitions found, use --layout single or dual")
+        lines.append(f"keep esp (#{esp['num']}, {human((esp['end'] - esp['start'] + 1) * ss)}) "
+                     f"and pmos (#{pmos['num']}, {human((pmos['end'] - pmos['start'] + 1) * ss)})")
+        return ents, lines, (esp["num"], pmos["num"])
+
+    if esp or pmos:
+        raise Error("esp or pmos already exists, use --layout reinstall")
+    ud = gpt.find("userdata")
+    if not ud:
+        raise Error("no userdata partition, use --layout reinstall")
+    if max(parts, key=lambda p: p["end"])["slot"] != ud["slot"]:
+        raise Error("userdata is not the last partition, refusing to guess")
+    last = gpt.hdr["last"]
+    top = (last + 1) // align * align          # first LBA past the usable, aligned area
+    esp_n = esp_size // ss
+    ud_sz = (ud["end"] - ud["start"] + 1) * ss
+
+    if layout == "single":
+        pmos_start = ud["start"] // align * align + esp_n
+        if top - pmos_start < 8 * GIB // ss:
+            raise Error("less than 8 GiB would be left for pmos")
+        esp_start = ud["start"]
+        i = ud["slot"]
+        ents[i * esz : (i + 1) * esz] = bytes(esz)
+        lines.append(f"delete userdata (#{ud['num']}, {human(ud_sz)}); Android no longer boots")
+    else:
+        pmos_n = pmos_size // ss
+        pmos_start = top - pmos_n
+        esp_start = pmos_start - esp_n
+        ud_new_end = esp_start - 1
+        if (ud_new_end - ud["start"] + 1) * ss < MIN_ANDROID:
+            raise Error(f"userdata would shrink below {human(MIN_ANDROID)}; use a smaller --pmos-size")
+        i = ud["slot"]
+        ents[i * esz + 40 : i * esz + 48] = struct.pack("<Q", ud_new_end)
+        lines.append(f"shrink userdata (#{ud['num']}) from {human(ud_sz)} to "
+                     f"{human((ud_new_end - ud['start'] + 1) * ss)}; Android data is lost "
+                     f"and must be wiped from Android recovery")
+
+    s1 = gpt.free_slot(ents)
+    ents[s1 * esz : (s1 + 1) * esz] = make_entry(esz, EFI_SYSTEM, uuid.uuid4().bytes_le,
+                                                 esp_start, pmos_start - 1, "esp")
+    s2 = gpt.free_slot(ents)
+    ents[s2 * esz : (s2 + 1) * esz] = make_entry(esz, LINUX_FS, uuid.uuid4().bytes_le,
+                                                 pmos_start, top - 1, "pmos")
+    lines.append(f"create esp  (#{s1 + 1}) LBA {esp_start}-{pmos_start - 1}, "
+                 f"{human((pmos_start - esp_start) * ss)}")
+    lines.append(f"create pmos (#{s2 + 1}) LBA {pmos_start}-{top - 1}, "
+                 f"{human((top - pmos_start) * ss)}")
+    return ents, lines, (s1 + 1, s2 + 1)
+
+
+# --- images -----------------------------------------------------------------
+
+def run(cmd, check=True, **kw):
+    return subprocess.run(cmd, check=check, **kw)
+
+
+def blkid(path):
+    r = run(["blkid", "-p", "-o", "export", path], check=False, capture_output=True, text=True)
+    return dict(l.split("=", 1) for l in r.stdout.splitlines() if "=" in l)
+
+
+def find_images(args):
+    boot, root = args.boot_img, args.root_img
+    if boot and root:
+        return boot, root
+    work = args.pmbootstrap_work or os.path.expanduser("~/.local/var/pmbootstrap")
+    base = os.path.join(work, "chroot_native/home/pmos/rootfs")
+    boot = boot or os.path.join(base, "xiaomi-marble-boot.img")
+    root = root or os.path.join(base, "xiaomi-marble-root.img")
+    return boot, root
+
+
+def check_images(boot, root, esp_bytes, pmos_bytes, strict):
+    for p in (boot, root):
+        if not os.path.isfile(p):
+            raise Error(f"{p} not found; build the images with "
+                        "'pmbootstrap install --split' or pass --boot-img/--root-img")
+    if os.path.getsize(boot) > esp_bytes:
+        raise Error(f"{boot} does not fit into the esp partition")
+    if os.path.getsize(root) > pmos_bytes:
+        raise Error(f"{root} does not fit into the pmos partition")
+    if not strict:
+        return
+    b, r = blkid(boot), blkid(root)
+    if b.get("TYPE") not in ("ext2", "ext3", "ext4", "vfat"):
+        raise Error(f"{boot} is not a boot filesystem image (type {b.get('TYPE')})")
+    if r.get("TYPE") not in ("ext4", "btrfs", "f2fs", "xfs", "crypto_LUKS"):
+        raise Error(f"{root} is not a root filesystem image (type {r.get('TYPE')})")
+    for img, info in ((boot, b), (root, r)):
+        bs = int(info.get("BLOCK_SIZE") or 0)
+        if info["TYPE"] != "crypto_LUKS" and bs and bs < 4096:
+            raise Error(f"{img} uses {bs}-byte blocks; the phone's storage has 4096-byte "
+                        "sectors and could not mount it. Rebuild the image with "
+                        "'pmbootstrap install --split --sector-size 4096'")
+    if b["TYPE"].startswith("ext") and shutil.which("debugfs"):
+        out = run(["debugfs", "-R", "stat /extlinux/extlinux.conf", boot], check=False,
+                  capture_output=True, text=True)
+        if "Inode:" not in out.stdout:
+            raise Error(f"{boot} has no /extlinux/extlinux.conf; U-Boot could not boot it. "
+                        "Check that the image was built for xiaomi-marble")
+
+
+def wait_node(disk, num):
+    name = os.path.basename(os.path.realpath(disk.path))
+    for _ in range(60):
+        try:
+            for ent in os.listdir(f"/sys/block/{name}"):
+                pf = f"/sys/block/{name}/{ent}/partition"
+                if ent.startswith(name) and os.path.exists(pf) and int(open(pf).read()) == num:
+                    node = f"/dev/{ent}"
+                    if os.path.exists(node):
+                        return node
+        except OSError:
+            pass
+        time.sleep(0.25)
+    raise Error(f"partition {num} did not appear on {disk.path}")
+
+
+def reread(disk):
+    try:
+        fcntl.ioctl(disk.fd, 0x125F)
+    except OSError:
+        run(["partprobe", disk.path], check=False)
+    run(["udevadm", "settle"], check=False)
+
+
+def write_image(img, node):
+    run(["wipefs", "-a", "-q", node], check=False)
+    run(["dd", f"if={img}", f"of={node}", "bs=4M", "conv=fsync", "oflag=direct",
+         "status=progress"])
+    n = os.path.getsize(img)
+    print(f"verifying {node} ...")
+    if run(["cmp", "-n", str(n), img, node], check=False).returncode:
+        raise Error(f"{node} differs from {img} after writing")
+
+
+def grow_fs(dev, label, keyfile=None):
+    t = blkid(dev).get("TYPE", "")
+    print(f"growing {label} ({t or 'unknown'}) ...")
+    if t == "crypto_LUKS":
+        mapper = f"marble-{label}"
+        cmd = ["cryptsetup", "open", dev, mapper]
+        if keyfile:
+            cmd += ["--key-file", keyfile]
+        run(cmd)
+        try:
+            run(["cryptsetup", "resize", mapper] + (["--key-file", keyfile] if keyfile else []))
+            grow_fs(f"/dev/mapper/{mapper}", label + "-inner")
+        finally:
+            run(["cryptsetup", "close", mapper], check=False)
+    elif t in ("ext2", "ext3", "ext4"):
+        if run(["e2fsck", "-f", "-y", dev], check=False).returncode > 2:
+            raise Error(f"e2fsck failed on {dev}")
+        run(["resize2fs", dev])
+    elif t in ("btrfs", "xfs"):
+        with tempfile.TemporaryDirectory() as mnt:
+            run(["mount", dev, mnt])
+            try:
+                run(["btrfs", "filesystem", "resize", "max", mnt] if t == "btrfs"
+                    else ["xfs_growfs", mnt])
+            finally:
+                run(["umount", mnt])
+    elif t == "f2fs":
+        run(["resize.f2fs", dev])
+    else:
+        print(f"warning: cannot grow '{t}'; the filesystem keeps the size of the image")
+
+
+# --- commands ---------------------------------------------------------------
+
+def need_root(argv):
+    if os.geteuid() == 0:
+        return
+    for tool in ("doas", "sudo"):
+        if shutil.which(tool):
+            os.execvp(tool, [tool, sys.executable, os.path.abspath(__file__)] + argv)
+    raise Error("run as root")
+
+
+def resolve_device(args):
+    if args.device:
+        return args.device
+    found = candidates()
+    if len(found) != 1:
+        raise Error("expected exactly one phone in U-Boot mass storage mode, found "
+                    f"{len(found)}; pass --device /dev/sdX (see 'marble-install list')")
+    return found[0]
+
+
+def cmd_list(args):
+    found = candidates()
+    for p in found:
+        n = os.path.basename(p)
+        print(f"{p}  {sysfs(n, 'vendor')} {sysfs(n, 'model')}")
+    if not found:
+        print("no marble LUN 0 found; boot the phone to U-Boot and choose "
+              "'Enable USB mass storage'")
+    return 0 if found else 1
+
+
+def cmd_show(args):
+    disk = Disk(resolve_device(args), sector_size=args.sector_size)
+    gpt = Gpt(disk)
+    check_marble(disk, gpt)
+    print(f"{disk.path}: {human(disk.size)}, {disk.ss}-byte sectors")
+    for p in gpt.partitions():
+        print(f"{p['num']:3d}  {p['start']:>10d}-{p['end']:<10d} "
+              f"{human((p['end'] - p['start'] + 1) * disk.ss):>9}  {p['name']}")
+    return 0
+
+
+def confirm(layout, assume_yes):
+    phrase = "reinstall" if layout == "reinstall" else "erase userdata"
+    if assume_yes:
+        return
+    print(f"\nType '{phrase}' to continue: ", end="", flush=True)
+    if sys.stdin.readline().strip() != phrase:
+        raise Error("aborted")
+
+
+def cmd_install(args):
+    disk = Disk(resolve_device(args), writable=not args.dry_run, sector_size=args.sector_size)
+    gpt = Gpt(disk)
+    check_marble(disk, gpt)
+    esp_b, pmos_b = parse_size(args.esp_size), parse_size(args.pmos_size)
+    ents, lines, (esp_n, pmos_n) = plan_layout(gpt, args.layout, esp_b, pmos_b)
+    boot, root = find_images(args)
+    parts = {p["num"]: p for p in Gpt(disk).partitions()}
+    new_parts = {}
+    if args.layout == "reinstall":
+        for n in (esp_n, pmos_n):
+            new_parts[n] = (parts[n]["end"] - parts[n]["start"] + 1) * disk.ss
+    else:
+        h = gpt.hdr
+        esz = h["esz"]
+        for n in (esp_n, pmos_n):
+            e = ents[(n - 1) * esz : n * esz]
+            s, t = struct.unpack("<QQ", e[32:48])
+            new_parts[n] = (t - s + 1) * disk.ss
+    check_images(boot, root, new_parts[esp_n], new_parts[pmos_n], not args.skip_image_checks)
+
+    print(f"disk   {disk.path}  {human(disk.size)}")
+    for l in lines:
+        print(f"plan   {l}")
+    print(f"write  {boot} -> esp,  {root} -> pmos")
+    print("keep   all other partitions unchanged (boot chain is not reachable over UMS)")
+    if args.dry_run:
+        print("\ndry run, nothing written")
+        return 0
+    confirm(args.layout, args.yes)
+
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    os.makedirs(args.backup_dir, exist_ok=True)
+    bak = os.path.join(args.backup_dir, f"marble-lun0-gpt-{stamp}.bak")
+    gpt.save(bak)
+    print(f"saved the partition table to {bak}")
+    print("restore it with: marble-install restore " + bak)
+
+    if args.layout != "reinstall":
+        gpt = gpt.apply(ents)
+        reread(disk)
+    esp_node, pmos_node = wait_node(disk, esp_n), wait_node(disk, pmos_n)
+    for node in (esp_node, pmos_node):
+        if is_mounted(node):
+            raise Error(f"{node} is mounted, unmount it first")
+    write_image(boot, esp_node)
+    write_image(root, pmos_node)
+    if not args.no_resize:
+        grow_fs(esp_node, "esp")
+        grow_fs(pmos_node, "pmos", args.luks_key_file)
+    disk.sync()
+    run(["sync"])
+    print("\nDone. On the phone, press a key to leave mass storage mode, then choose\n"
+          "'Boot postmarketOS' (or wait for the countdown after a reset).")
+    if args.layout == "dual":
+        print("Android: wipe data from the Android recovery before the next Android boot.")
+    return 0
+
+
+def cmd_restore(args):
+    disk = Disk(resolve_device(args), writable=True, sector_size=args.sector_size)
+    if is_mounted(disk.path):
+        raise Error("a partition of this disk is mounted")
+    restore_gpt(disk, args.backup)
+    reread(disk)
+    print("partition table restored (partition contents are not touched)")
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="marble-install", description=__doc__.split("\n\n")[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    def common(p):
+        p.add_argument("--device", help="block device of the phone's LUN 0 (default: autodetect)")
+        p.add_argument("--sector-size", type=int, default=4096, help=argparse.SUPPRESS)
+
+    sub.add_parser("list", help="find the phone in U-Boot mass storage mode")
+    common(sub.add_parser("show", help="print the partition table of the phone"))
+
+    p = sub.add_parser("install", help="partition the phone and write the images")
+    common(p)
+    p.add_argument("--layout", choices=("single", "dual", "reinstall"), required=True,
+                   help="single: replace Android userdata; dual: shrink userdata and keep "
+                        "Android; reinstall: reuse existing esp and pmos partitions")
+    p.add_argument("--pmos-size", default="64G", help="dual layout: size of pmos (default 64G)")
+    p.add_argument("--esp-size", default="1G", help="size of the boot partition (default 1G)")
+    p.add_argument("--boot-img", help="boot image from 'pmbootstrap install --split'")
+    p.add_argument("--root-img", help="root image from 'pmbootstrap install --split'")
+    p.add_argument("--pmbootstrap-work", help="pmbootstrap work directory to take the images from")
+    p.add_argument("--luks-key-file", help="passphrase file for a LUKS root (else asked)")
+    p.add_argument("--no-resize", action="store_true", help="keep the image sizes")
+    p.add_argument("--skip-image-checks", action="store_true")
+    p.add_argument("--backup-dir", default=".", help="where to save the old partition table")
+    p.add_argument("--dry-run", action="store_true", help="show the plan, write nothing")
+    p.add_argument("--yes", action="store_true", help="do not ask for confirmation")
+
+    p = sub.add_parser("restore", help="write back a saved partition table")
+    common(p)
+    p.add_argument("backup")
+
+    args = ap.parse_args()
+    try:
+        need_root(sys.argv[1:])
+        return {"list": cmd_list, "show": cmd_show, "install": cmd_install,
+                "restore": cmd_restore}[args.cmd](args)
+    except (Error, subprocess.CalledProcessError) as e:
+        print(f"marble-install: {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
